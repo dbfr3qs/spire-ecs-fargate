@@ -3,6 +3,7 @@
 *
 !*/
 !*.*
+!LICENSE
 
 # Specific Go binary patterns found in this repo
 aws-fargate-nodeattestor
