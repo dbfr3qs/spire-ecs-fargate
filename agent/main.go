@@ -25,35 +25,29 @@ const (
 	defaultMetadataTimeout = 30 * time.Second
 )
 
-// FargateAttestorConfig configures the FargateAttestorPlugin.
+// FargateAttestorConfig holds plugin configuration.
 type FargateAttestorConfig struct {
 	MetadataEndpoint string        `hcl:"metadata_endpoint"`
-	Timeout          time.Duration `hcl:"-"` // Set programmatically after parsing
+	Timeout          time.Duration `hcl:"-"`
 }
 
-// FargateAttestorHCLConfig represents the HCL configuration structure
+// FargateAttestorHCLConfig represents HCL configuration for parsing.
 type FargateAttestorHCLConfig struct {
 	MetadataEndpoint string `hcl:"metadata_endpoint"`
 	Timeout          string `hcl:"timeout"`
 }
 
-// Plugin implements the NodeAttestor plugin for AWS Fargate
+// Plugin implements NodeAttestor for AWS Fargate tasks.
 type Plugin struct {
-	// UnimplementedNodeAttestorServer is embedded to satisfy gRPC
 	nodeattestorv1.UnimplementedNodeAttestorServer
-
-	// UnimplementedConfigServer is embedded to satisfy gRPC
 	configv1.UnimplementedConfigServer
 
-	// Configuration should be set atomically
 	configMtx sync.RWMutex
 	config    *FargateAttestorConfig
-
-	// The logger received from the framework via the SetLogger method
-	logger hclog.Logger
+	logger    hclog.Logger
 }
 
-// FargateTaskMetadata represents the ECS Task Metadata v4 structure
+// FargateTaskMetadata represents ECS Task Metadata v4 structure.
 type FargateTaskMetadata struct {
 	Cluster           string                 `json:"Cluster"`
 	TaskARN           string                 `json:"TaskARN"`
@@ -70,7 +64,7 @@ type FargateTaskMetadata struct {
 	TaskDefinitionArn string                 `json:"TaskDefinitionArn"`
 }
 
-// FargateContainerInfo represents container information from ECS Task Metadata
+// FargateContainerInfo represents container information from ECS Task Metadata.
 type FargateContainerInfo struct {
 	DockerID      string            `json:"DockerId"`
 	Name          string            `json:"Name"`
@@ -83,14 +77,13 @@ type FargateContainerInfo struct {
 	Type          string            `json:"Type"`
 }
 
-// FargateAttestationData represents the data sent to the server for attestation
+// FargateAttestationData represents attestation data sent to server.
 type FargateAttestationData struct {
 	TaskMetadata string   `json:"task_metadata"`
 	Selectors    []string `json:"selectors"`
 }
 
-// AidAttestation implements the NodeAttestor AidAttestation RPC. AidAttestation facilitates attestation by returning
-// the attestation payload and participating in attestation challenge/response.
+// AidAttestation facilitates attestation by returning the attestation payload.
 func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestationServer) error {
 	config, err := p.getConfig()
 	if err != nil {
@@ -99,7 +92,6 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 
 	p.logger.Debug("Starting Fargate attestation")
 
-	// Fetch task metadata from ECS metadata endpoint
 	taskMetadata, err := p.fetchTaskMetadata(stream.Context(), config)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to fetch task metadata: %v", err)
@@ -107,28 +99,38 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 
 	p.logger.Debug("Successfully fetched task metadata", "cluster", taskMetadata.Cluster, "taskArn", taskMetadata.TaskARN)
 
-	// Marshal the task metadata as JSON
+	attestationData, err := p.buildAttestationData(taskMetadata)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to build attestation data: %v", err)
+	}
+
+	if err := p.sendAttestationData(stream, attestationData); err != nil {
+		return err
+	}
+
+	return p.handleChallenges(stream)
+}
+
+func (p *Plugin) buildAttestationData(taskMetadata *FargateTaskMetadata) (*FargateAttestationData, error) {
 	taskMetadataJSON, err := json.Marshal(taskMetadata)
 	if err != nil {
-		return status.Errorf(codes.Internal, "failed to marshal task metadata: %v", err)
+		return nil, err
 	}
 
-	// Extract selectors from task metadata for workload identity
 	selectors := p.extractSelectors(taskMetadata)
-	p.logger.Debug("Extracted selectors from task metadata", "count", len(selectors), "selectors", selectors)
 
-	// Create attestation data with both raw metadata and extracted selectors
-	attestationData := &FargateAttestationData{
+	return &FargateAttestationData{
 		TaskMetadata: string(taskMetadataJSON),
 		Selectors:    selectors,
-	}
+	}, nil
+}
 
+func (p *Plugin) sendAttestationData(stream nodeattestorv1.NodeAttestor_AidAttestationServer, attestationData *FargateAttestationData) error {
 	attestationDataJSON, err := json.Marshal(attestationData)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to marshal attestation data: %v", err)
 	}
 
-	// Send the attestation data to the server
 	if err := stream.Send(&nodeattestorv1.PayloadOrChallengeResponse{
 		Data: &nodeattestorv1.PayloadOrChallengeResponse_Payload{
 			Payload: attestationDataJSON,
@@ -139,7 +141,10 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 
 	p.logger.Debug("Sent attestation data to server")
 
-	// The server may send challenges, but for Fargate attestation we don't expect any
+	return nil
+}
+
+func (p *Plugin) handleChallenges(stream nodeattestorv1.NodeAttestor_AidAttestationServer) error {
 	for {
 		req, err := stream.Recv()
 		if err != nil {
@@ -155,34 +160,24 @@ func (p *Plugin) AidAttestation(stream nodeattestorv1.NodeAttestor_AidAttestatio
 	}
 }
 
-// fetchTaskMetadata retrieves the ECS Task Metadata from the v4 endpoint
+// fetchTaskMetadata retrieves ECS Task Metadata from the v4 endpoint.
 func (p *Plugin) fetchTaskMetadata(ctx context.Context, config *FargateAttestorConfig) (*FargateTaskMetadata, error) {
-	// Use the configured endpoint or fall back to the environment variable
-	metadataEndpoint := config.MetadataEndpoint
-	if metadataEndpoint == "" {
-		metadataEndpoint = os.Getenv("ECS_CONTAINER_METADATA_URI_V4")
-		if metadataEndpoint == "" {
+	endpoint := config.MetadataEndpoint
+	if endpoint == "" {
+		endpoint = os.Getenv("ECS_CONTAINER_METADATA_URI_V4")
+		if endpoint == "" {
 			return nil, fmt.Errorf("no metadata endpoint configured and ECS_CONTAINER_METADATA_URI_V4 not set")
 		}
 	}
 
-	// Use the metadata endpoint directly - it should already be the full URL
-	metadataURL := metadataEndpoint
+	p.logger.Debug("Fetching task metadata", "endpoint", endpoint)
 
-	p.logger.Debug("Fetching task metadata", "endpoint", metadataURL)
-
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: config.Timeout,
-	}
-
-	// Create request with context
-	req, err := http.NewRequestWithContext(ctx, "GET", metadataURL, nil)
+	client := &http.Client{Timeout: config.Timeout}
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	// Make the request
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch metadata: %v", err)
@@ -193,7 +188,6 @@ func (p *Plugin) fetchTaskMetadata(ctx context.Context, config *FargateAttestorC
 		return nil, fmt.Errorf("metadata endpoint returned status %d", resp.StatusCode)
 	}
 
-	// Read and parse the response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %v", err)
@@ -245,65 +239,83 @@ func (p *Plugin) buildConfig(req *configv1.ConfigureRequest) (*FargateAttestorCo
 	return newConfig, nil
 }
 
-// extractSelectors extracts meaningful selectors from ECS task metadata for workload identity
+// extractSelectors extracts selectors from ECS task metadata for workload identity.
 func (p *Plugin) extractSelectors(metadata *FargateTaskMetadata) []string {
 	var selectors []string
 
-	// High-value selectors for strong identity guarantees
-	if metadata.Cluster != "" {
-		selectors = append(selectors, fmt.Sprintf("aws_fargate:cluster:%s", metadata.Cluster))
+	selectors = append(selectors, p.extractTaskSelectors(metadata)...)
+	selectors = append(selectors, p.extractARNSelectors(metadata.TaskARN)...)
+	selectors = append(selectors, p.extractTagSelectors(metadata.TaskTags)...)
+	selectors = append(selectors, p.extractContainerSelectors(metadata.Containers)...)
+
+	return selectors
+}
+
+func (p *Plugin) extractTaskSelectors(metadata *FargateTaskMetadata) []string {
+	var selectors []string
+
+	fields := map[string]string{
+		"cluster":                    metadata.Cluster,
+		"service":                    metadata.ServiceName,
+		"task_definition":            metadata.Family,
+		"task_definition_revision":   metadata.Revision,
+		"availability_zone":          metadata.AvailabilityZone,
+		"launch_type":               metadata.LaunchType,
 	}
 
-	if metadata.ServiceName != "" {
-		selectors = append(selectors, fmt.Sprintf("aws_fargate:service:%s", metadata.ServiceName))
-	}
-
-	if metadata.Family != "" {
-		selectors = append(selectors, fmt.Sprintf("aws_fargate:task_definition:%s", metadata.Family))
-	}
-
-	if metadata.Revision != "" {
-		selectors = append(selectors, fmt.Sprintf("aws_fargate:task_definition_revision:%s", metadata.Revision))
-	}
-
-	if metadata.AvailabilityZone != "" {
-		selectors = append(selectors, fmt.Sprintf("aws_fargate:availability_zone:%s", metadata.AvailabilityZone))
-	}
-
-	if metadata.LaunchType != "" {
-		selectors = append(selectors, fmt.Sprintf("aws_fargate:launch_type:%s", metadata.LaunchType))
-	}
-
-	// Extract account ID and region from TaskARN
-	if metadata.TaskARN != "" {
-		// TaskARN format: arn:aws:ecs:region:account-id:task/cluster-name/task-id
-		if parts := strings.Split(metadata.TaskARN, ":"); len(parts) >= 5 {
-			if region := parts[3]; region != "" {
-				selectors = append(selectors, fmt.Sprintf("aws_fargate:region:%s", region))
-			}
-			if accountID := parts[4]; accountID != "" {
-				selectors = append(selectors, fmt.Sprintf("aws_fargate:account:%s", accountID))
-			}
+	for key, value := range fields {
+		if value != "" {
+			selectors = append(selectors, fmt.Sprintf("aws_fargate:%s:%s", key, value))
 		}
-		selectors = append(selectors, fmt.Sprintf("aws_fargate:task_arn:%s", metadata.TaskARN))
 	}
 
-	// Extract task tags for custom business logic
-	for key, value := range metadata.TaskTags {
+	return selectors
+}
+
+func (p *Plugin) extractARNSelectors(taskARN string) []string {
+	var selectors []string
+
+	if taskARN == "" {
+		return selectors
+	}
+
+	selectors = append(selectors, fmt.Sprintf("aws_fargate:task_arn:%s", taskARN))
+
+	if parts := strings.Split(taskARN, ":"); len(parts) >= 5 {
+		if region := parts[3]; region != "" {
+			selectors = append(selectors, fmt.Sprintf("aws_fargate:region:%s", region))
+		}
+		if accountID := parts[4]; accountID != "" {
+			selectors = append(selectors, fmt.Sprintf("aws_fargate:account:%s", accountID))
+		}
+	}
+
+	return selectors
+}
+
+func (p *Plugin) extractTagSelectors(tags map[string]string) []string {
+	var selectors []string
+
+	for key, value := range tags {
 		if key != "" && value != "" {
 			selectors = append(selectors, fmt.Sprintf("aws_fargate:tag:%s:%s", key, value))
 		}
 	}
 
-	// Extract container information
-	for _, container := range metadata.Containers {
+	return selectors
+}
+
+func (p *Plugin) extractContainerSelectors(containers []FargateContainerInfo) []string {
+	var selectors []string
+
+	for _, container := range containers {
 		if container.Name != "" {
 			selectors = append(selectors, fmt.Sprintf("aws_fargate:container:%s", container.Name))
 		}
 		if container.Image != "" {
 			selectors = append(selectors, fmt.Sprintf("aws_fargate:image:%s", container.Image))
 		}
-		// Extract container labels
+
 		for key, value := range container.Labels {
 			if key != "" && value != "" {
 				selectors = append(selectors, fmt.Sprintf("aws_fargate:container_label:%s:%s", key, value))

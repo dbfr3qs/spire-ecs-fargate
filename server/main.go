@@ -19,19 +19,17 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const (
-	pluginName = "aws_fargate_task"
-)
 
-// FargateAttestorConfig holds configuration for the Fargate attestor plugin
+
+// FargateAttestorConfig holds plugin configuration.
 type FargateAttestorConfig struct {
-	TrustDomain     string   `hcl:"trust_domain"`
-	AllowedAccounts []string `hcl:"allowed_accounts"`
-	AllowedClusters []string `hcl:"allowed_clusters"`
-	AgentPathTemplate string `hcl:"agent_path_template"`
+	TrustDomain       string   `hcl:"trust_domain"`
+	AllowedAccounts   []string `hcl:"allowed_accounts"`
+	AllowedClusters   []string `hcl:"allowed_clusters"`
+	AgentPathTemplate string   `hcl:"agent_path_template"`
 }
 
-// FargateTaskMetadata represents the ECS Task Metadata v4 structure we care about
+// FargateTaskMetadata represents ECS Task Metadata v4 structure.
 type FargateTaskMetadata struct {
 	Cluster           string            `json:"Cluster"`
 	TaskARN           string            `json:"TaskARN"`
@@ -44,18 +42,15 @@ type FargateTaskMetadata struct {
 	TaskDefinitionArn string            `json:"TaskDefinitionArn"`
 }
 
-// FargateAttestationData represents the data sent by the agent for attestation
+// FargateAttestationData represents attestation data from agent.
 type FargateAttestationData struct {
 	TaskMetadata string   `json:"task_metadata"`
 	Selectors    []string `json:"selectors"`
 }
 
-// Plugin implements the NodeAttestor plugin for AWS Fargate (server side)
+// Plugin implements NodeAttestor for AWS Fargate tasks (server side).
 type Plugin struct {
-	// UnimplementedNodeAttestorServer is embedded to satisfy gRPC
 	nodeattestorv1.UnimplementedNodeAttestorServer
-
-	// UnimplementedConfigServer is embedded to satisfy gRPC
 	configv1.UnimplementedConfigServer
 
 	log    hclog.Logger
@@ -63,78 +58,87 @@ type Plugin struct {
 	mtx    sync.RWMutex
 }
 
-// Attest implements the server side logic for the AWS Fargate task node attestation plugin.
+// Attest implements server side logic for AWS Fargate task node attestation.
 func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	config, err := p.getConfig()
 	if err != nil {
 		return err
 	}
 
-	req, err := stream.Recv()
+	attestationData, metadata, err := p.parseAttestationRequest(stream)
 	if err != nil {
 		return err
 	}
 
-	// Parse attestation data from agent
-	payload := req.GetPayload()
-	if payload == nil {
-		return status.Error(codes.InvalidArgument, "missing attestation payload")
-	}
-
-	var attestationData FargateAttestationData
-	if err := json.Unmarshal(payload, &attestationData); err != nil {
-		return status.Errorf(codes.InvalidArgument, "failed to unmarshal attestation data: %v", err)
-	}
-
-	// Parse task metadata
-	var metadata FargateTaskMetadata
-	if err := json.Unmarshal([]byte(attestationData.TaskMetadata), &metadata); err != nil {
-		return status.Errorf(codes.InvalidArgument, "failed to unmarshal task metadata: %v", err)
-	}
-
-	// Extract account ID from Task ARN
 	accountID, err := p.extractAccountIDFromTaskARN(metadata.TaskARN)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "failed to extract account ID from Task ARN: %v", err)
 	}
 
-	// Validate account is allowed
-	if !p.isAccountIDAllowed(config, accountID) {
-		return status.Errorf(codes.PermissionDenied, "account ID %s is not allowed", accountID)
+	if err := p.validateAttestation(config, accountID, metadata.Cluster); err != nil {
+		return err
 	}
 
-	// Validate cluster is allowed
-	if !p.isClusterAllowed(config, metadata.Cluster) {
-		return status.Errorf(codes.PermissionDenied, "cluster %s is not allowed", metadata.Cluster)
-	}
-
-	// Generate SPIFFE ID
-	spiffeID, err := p.generateSpiffeID(config, accountID, &metadata)
+	spiffeID, err := p.generateSpiffeID(config, accountID, metadata)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to generate SPIFFE ID: %v", err)
 	}
 
-	// Validate and filter selectors
-	selectors := p.validateAndFilterSelectors(attestationData.Selectors, accountID, &metadata)
+	selectors := p.buildSelectors(attestationData.Selectors, accountID, metadata)
 
-	// Generate additional selectors
-	additionalSelectors := p.generateSelectors(accountID, &metadata)
-	selectors = append(selectors, additionalSelectors...)
-
-	// DEBUG: Log that we're setting CanReattest to true
-	if p.log != nil {
-		p.log.Info("[DEBUG] Setting CanReattest=true for agent", "spiffe_id", spiffeID.String())
-	}
+	p.log.Info("[DEBUG] Setting CanReattest=true for agent", "spiffe_id", spiffeID.String())
 
 	return stream.Send(&nodeattestorv1.AttestResponse{
 		Response: &nodeattestorv1.AttestResponse_AgentAttributes{
 			AgentAttributes: &nodeattestorv1.AgentAttributes{
-				CanReattest: true,
-				SpiffeId:    spiffeID.String(),
+				CanReattest:    true,
+				SpiffeId:       spiffeID.String(),
 				SelectorValues: selectors,
 			},
 		},
 	})
+}
+
+func (p *Plugin) parseAttestationRequest(stream nodeattestorv1.NodeAttestor_AttestServer) (*FargateAttestationData, *FargateTaskMetadata, error) {
+	req, err := stream.Recv()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	payload := req.GetPayload()
+	if payload == nil {
+		return nil, nil, status.Error(codes.InvalidArgument, "missing attestation payload")
+	}
+
+	var attestationData FargateAttestationData
+	if err := json.Unmarshal(payload, &attestationData); err != nil {
+		return nil, nil, status.Errorf(codes.InvalidArgument, "failed to unmarshal attestation data: %v", err)
+	}
+
+	var metadata FargateTaskMetadata
+	if err := json.Unmarshal([]byte(attestationData.TaskMetadata), &metadata); err != nil {
+		return nil, nil, status.Errorf(codes.InvalidArgument, "failed to unmarshal task metadata: %v", err)
+	}
+
+	return &attestationData, &metadata, nil
+}
+
+func (p *Plugin) validateAttestation(config *FargateAttestorConfig, accountID, cluster string) error {
+	if !p.isAccountIDAllowed(config, accountID) {
+		return status.Errorf(codes.PermissionDenied, "account ID %s is not allowed", accountID)
+	}
+
+	if !p.isClusterAllowed(config, cluster) {
+		return status.Errorf(codes.PermissionDenied, "cluster %s is not allowed", cluster)
+	}
+
+	return nil
+}
+
+func (p *Plugin) buildSelectors(agentSelectors []string, accountID string, metadata *FargateTaskMetadata) []string {
+	selectors := p.validateAndFilterSelectors(agentSelectors, accountID, metadata)
+	additionalSelectors := p.generateSelectors(accountID, metadata)
+	return append(selectors, additionalSelectors...)
 }
 
 // Configure configures the FargateAttestorPlugin.
@@ -162,26 +166,13 @@ func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*co
 	return &configv1.ValidateResponse{Valid: true}, nil
 }
 
-// SetLogger sets this plugin's logger
+// SetLogger sets the plugin logger.
 func (p *Plugin) SetLogger(log hclog.Logger) {
 	p.log = log
 }
 
 func (p *Plugin) buildConfig(req *configv1.ConfigureRequest) (*FargateAttestorConfig, error) {
-	config := new(FargateAttestorConfig)
-	if err := hcl.Decode(config, req.HclConfiguration); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
-	}
-
-	if config.TrustDomain == "" {
-		return nil, status.Error(codes.InvalidArgument, "trust_domain is required")
-	}
-
-	if config.AgentPathTemplate == "" {
-		config.AgentPathTemplate = "/aws_fargate_task/{{ .accountID }}/{{ .cluster }}"
-	}
-
-	return config, nil
+	return p.parseConfig(req.HclConfiguration)
 }
 
 func (p *Plugin) getConfig() (*FargateAttestorConfig, error) {
@@ -195,6 +186,10 @@ func (p *Plugin) getConfig() (*FargateAttestorConfig, error) {
 }
 
 func (p *Plugin) buildValidateConfig(hclConfiguration string) (*FargateAttestorConfig, error) {
+	return p.parseConfig(hclConfiguration)
+}
+
+func (p *Plugin) parseConfig(hclConfiguration string) (*FargateAttestorConfig, error) {
 	config := new(FargateAttestorConfig)
 	if err := hcl.Decode(config, hclConfiguration); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "unable to decode configuration: %v", err)
@@ -212,7 +207,6 @@ func (p *Plugin) buildValidateConfig(hclConfiguration string) (*FargateAttestorC
 }
 
 func (p *Plugin) extractAccountIDFromTaskARN(taskARN string) (string, error) {
-	// Task ARN format: arn:aws:ecs:region:account-id:task/cluster-name/task-id
 	parts := strings.Split(taskARN, ":")
 	if len(parts) < 5 {
 		return "", fmt.Errorf("invalid Task ARN format: %s", taskARN)
@@ -222,7 +216,7 @@ func (p *Plugin) extractAccountIDFromTaskARN(taskARN string) (string, error) {
 
 func (p *Plugin) isAccountIDAllowed(config *FargateAttestorConfig, accountID string) bool {
 	if len(config.AllowedAccounts) == 0 {
-		return true // Allow all if not configured
+		return true
 	}
 
 	for _, allowed := range config.AllowedAccounts {
@@ -235,7 +229,7 @@ func (p *Plugin) isAccountIDAllowed(config *FargateAttestorConfig, accountID str
 
 func (p *Plugin) isClusterAllowed(config *FargateAttestorConfig, cluster string) bool {
 	if len(config.AllowedClusters) == 0 {
-		return true // Allow all if not configured
+		return true
 	}
 
 	for _, allowed := range config.AllowedClusters {
