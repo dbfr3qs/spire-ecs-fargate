@@ -1,0 +1,138 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database for SPIRE Server
+  postgres:
+    image: postgres:15-alpine
+    # PostgreSQL configuration to fix SPIRE agent SVID authorization race condition
+    # These settings reduce commit latency and improve transaction visibility
+    command: [
+      "postgres",
+      "-c", "synchronous_commit=off",        # Reduce commit latency for faster transaction visibility
+      "-c", "commit_delay=500",               # Small delay to batch commits (microseconds)
+      "-c", "wal_writer_delay=100ms",         # More frequent WAL writes
+      "-c", "checkpoint_completion_target=0.7", # More frequent checkpoints
+      "-c", "log_statement=none"              # Reduce logging overhead
+    ]
+    environment:
+      POSTGRES_DB: spire
+      POSTGRES_USER: spire
+      POSTGRES_PASSWORD: spire
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - spire-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spire -d spire"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Mock ECS Task Metadata Endpoint
+  ecs-metadata-mock:
+    build: ./mock-metadata
+    ports:
+      - "8090:8080"  # Mock ECS metadata endpoint (local development)
+    networks:
+      - spire-network
+
+  # SPIRE Server (custom build with aws_fargate_task plugin)
+  spire-server:
+    build: ./spire-server
+    hostname: spire-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - spire-server-data:/opt/spire/data/server
+    ports:
+      - "8081:8081"
+    networks:
+      - spire-network
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8081 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # Application with SPIRE Agent (simulating Fargate task)
+  fargate-app:
+    build: ./app-with-agent
+    hostname: fargate-app
+    depends_on:
+      ecs-metadata-mock:
+        condition: service_started
+      spire-server:
+        condition: service_healthy
+    volumes:
+      - spire-agent-socket:/tmp/spire-agent/public
+      - ./trust-bundle:/opt/spire/trust-bundle:ro
+    ports:
+      - "8080:8080"  # Web application port
+    environment:
+      - SPIRE_SERVER_ADDRESS=spire-server
+      - SPIRE_SERVER_PORT=8081
+      - ECS_CONTAINER_METADATA_URI_V4=http://ecs-metadata-mock:8080/v4/metadata
+      - SPIRE_TRUST_DOMAIN=example.org
+    networks:
+      - spire-network
+
+  # API Service with SPIRE Agent (dedicated attestation API)
+  api-service-with-agent:
+    build: ./api-service-with-agent
+    hostname: api-service-with-agent
+    depends_on:
+      ecs-metadata-mock:
+        condition: service_started
+      spire-server:
+        condition: service_healthy
+      fargate-app:
+        condition: service_started
+    volumes:
+      - api-agent-socket:/tmp/spire-agent/public
+      - ./trust-bundle:/opt/spire/trust-bundle:ro
+    ports:
+      - "8082:8080"  # API service port
+    environment:
+      - SPIRE_SERVER_ADDRESS=spire-server
+      - SPIRE_SERVER_PORT=8081
+      - ECS_CONTAINER_METADATA_URI_V4=http://ecs-metadata-mock:8080/v4/metadata
+      - SPIRE_TRUST_DOMAIN=example.org
+    networks:
+      - spire-network
+
+  # CLI Client with SPIRE Agent (command-line tool for querying services)
+  cli-client-with-agent:
+    build: ./cli-client-with-agent
+    hostname: cli-client-with-agent
+    depends_on:
+      ecs-metadata-mock:
+        condition: service_started
+      spire-server:
+        condition: service_healthy
+      fargate-app:
+        condition: service_started
+      api-service-with-agent:
+        condition: service_started
+    volumes:
+      - cli-agent-socket:/tmp/spire-agent/public
+      - ./trust-bundle:/opt/spire/trust-bundle:ro
+    environment:
+      - SPIRE_SERVER_ADDRESS=spire-server
+      - SPIRE_SERVER_PORT=8081
+      - ECS_CONTAINER_METADATA_URI_V4=http://ecs-metadata-mock:8080/v4/metadata
+      - SPIRE_TRUST_DOMAIN=example.org
+    networks:
+      - spire-network
+
+volumes:
+  postgres-data:
+  spire-server-data:
+  spire-agent-socket:
+  api-agent-socket:
+  cli-agent-socket:
+
+networks:
+  spire-network:
+    driver: bridge

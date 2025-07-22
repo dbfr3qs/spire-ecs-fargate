@@ -1,0 +1,55 @@
+# Go binaries (executables)
+# Ignore all files without extensions (typical Go binaries)
+*
+!*/
+!*.*
+
+# Specific Go binary patterns found in this repo
+aws-fargate-nodeattestor
+aws-fargate-nodeattestor-*
+aws-fargate-server-nodeattestor
+aws-fargate-server-nodeattestor-*
+
+# Common Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test binaries
+*.test
+
+# Go coverage files
+*.out
+*.prof
+
+# Certificate and key files
+*.pem
+*.crt
+*.key
+*.p12
+*.pfx
+
+# Go module cache
+go.sum
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
