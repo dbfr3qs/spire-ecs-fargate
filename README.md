@@ -1,6 +1,6 @@
 # SPIRE ECS Fargate Plugin Suite
 
-A comprehensive external plugin solution for SPIRE that enables secure workload identity attestation in AWS ECS Fargate environments.
+A comprehensive external plugin solution for [SPIRE](https://spiffe.io/docs/latest/spire-about/) that enables secure workload identity attestation in AWS ECS Fargate environments.
 
 ## Overview
 
@@ -285,5 +285,5 @@ This project follows the same license as the SPIRE project.
 ---
 
 For more information about SPIRE and the Plugin SDK, visit:
-- [SPIRE Documentation](https://spiffe.io/docs/latest/spire/)
+- [SPIRE Documentation](https://spiffe.io/docs/latest/spire-about/)
 - [SPIRE Plugin SDK](https://github.com/spiffe/spire-plugin-sdk)
