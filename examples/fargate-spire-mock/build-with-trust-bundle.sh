@@ -136,13 +136,124 @@ cleanup_distributed_bundles() {
     log_success "Distributed trust bundles cleaned up"
 }
 
+# Function to build refactored SPIRE plugin binaries from source
+build_plugin_binaries() {
+    log_info "Building refactored SPIRE plugin binaries from source..."
+    
+    # Define paths relative to script directory
+    local REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"  # Go up two levels from examples/fargate-spire-mock
+    local AGENT_SOURCE="$REPO_ROOT/agent"
+    local SERVER_SOURCE="$REPO_ROOT/server"
+    
+    # Verify source directories exist
+    if [[ ! -d "$AGENT_SOURCE" ]]; then
+        log_error "Agent source directory not found: $AGENT_SOURCE"
+        return 1
+    fi
+    
+    if [[ ! -d "$SERVER_SOURCE" ]]; then
+        log_error "Server source directory not found: $SERVER_SOURCE"
+        return 1
+    fi
+    
+    # Build agent binary (cross-compile for Linux)
+    log_info "Building agent binary from refactored source..."
+    (cd "$AGENT_SOURCE" && \
+        GOOS=linux GOARCH=amd64 go build -o aws-fargate-nodeattestor main.go) || {
+        log_error "Failed to build agent binary"
+        return 1
+    }
+    
+    # Build server binary (cross-compile for Linux) 
+    log_info "Building server binary from refactored source..."
+    (cd "$SERVER_SOURCE" && \
+        GOOS=linux GOARCH=amd64 go build -o aws-fargate-server-nodeattestor main.go) || {
+        log_error "Failed to build server binary"
+        return 1
+    }
+    
+    # Copy binaries to appropriate service directories
+    log_info "Distributing compiled binaries to service directories..."
+    
+    # Copy agent binary to all agent service directories
+    cp "$AGENT_SOURCE/aws-fargate-nodeattestor" "$SCRIPT_DIR/app-with-agent/" || {
+        log_error "Failed to copy agent binary to app-with-agent"
+        return 1
+    }
+    
+    cp "$AGENT_SOURCE/aws-fargate-nodeattestor" "$SCRIPT_DIR/api-service-with-agent/" || {
+        log_error "Failed to copy agent binary to api-service-with-agent"
+        return 1
+    }
+    
+    cp "$AGENT_SOURCE/aws-fargate-nodeattestor" "$SCRIPT_DIR/cli-client-with-agent/" || {
+        log_error "Failed to copy agent binary to cli-client-with-agent"
+        return 1
+    }
+    
+    # Copy server binary to server directory
+    cp "$SERVER_SOURCE/aws-fargate-server-nodeattestor" "$SCRIPT_DIR/spire-server/" || {
+        log_error "Failed to copy server binary to spire-server"
+        return 1
+    }
+    
+    # Verify binaries were copied successfully
+    for binary_path in \
+        "$SCRIPT_DIR/app-with-agent/aws-fargate-nodeattestor" \
+        "$SCRIPT_DIR/api-service-with-agent/aws-fargate-nodeattestor" \
+        "$SCRIPT_DIR/cli-client-with-agent/aws-fargate-nodeattestor" \
+        "$SCRIPT_DIR/spire-server/aws-fargate-server-nodeattestor"; do
+        
+        if [[ ! -f "$binary_path" ]]; then
+            log_error "Binary not found after copy: $binary_path"
+            return 1
+        fi
+        
+        if [[ ! -x "$binary_path" ]]; then
+            log_warning "Making binary executable: $binary_path"
+            chmod +x "$binary_path"
+        fi
+    done
+    
+    log_success "Successfully built and distributed refactored plugin binaries"
+    log_info "Agent binaries: $(ls -la $SCRIPT_DIR/*/aws-fargate-nodeattestor | wc -l) copies"
+    log_info "Server binary: $(ls -la $SCRIPT_DIR/spire-server/aws-fargate-server-nodeattestor | wc -l) copy"
+    
+    return 0
+}
+
+# Function to clean up compiled binaries
+cleanup_plugin_binaries() {
+    log_info "Cleaning up compiled plugin binaries..."
+    
+    # Remove binaries from service directories
+    rm -f "$SCRIPT_DIR/app-with-agent/aws-fargate-nodeattestor" 2>/dev/null || true
+    rm -f "$SCRIPT_DIR/api-service-with-agent/aws-fargate-nodeattestor" 2>/dev/null || true  
+    rm -f "$SCRIPT_DIR/cli-client-with-agent/aws-fargate-nodeattestor" 2>/dev/null || true
+    rm -f "$SCRIPT_DIR/spire-server/aws-fargate-server-nodeattestor" 2>/dev/null || true
+    
+    # Also clean from source directories
+    local REPO_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")" 
+    rm -f "$REPO_ROOT/agent/aws-fargate-nodeattestor" 2>/dev/null || true
+    rm -f "$REPO_ROOT/server/aws-fargate-server-nodeattestor" 2>/dev/null || true
+    
+    log_success "Plugin binaries cleanup completed"
+}
+
 # Function to build containers with trust bundle
 build_containers() {
     log_info "Building containers with trust bundle..."
     
-    # First, distribute trust bundle to service directories
+    # First, build refactored plugin binaries from source
+    if ! build_plugin_binaries; then
+        log_error "Failed to build plugin binaries"
+        return 1
+    fi
+    
+    # Second, distribute trust bundle to service directories
     if ! distribute_trust_bundle; then
         log_error "Failed to distribute trust bundle"
+        cleanup_plugin_binaries  # Clean up binaries on failure
         return 1
     fi
     
@@ -153,12 +264,18 @@ build_containers() {
         # Clean up distributed trust bundles after successful build
         cleanup_distributed_bundles
         
+        # Clean up plugin binaries after successful build (they're now in containers)
+        cleanup_plugin_binaries
+        
         return 0
     else
         log_error "Container build failed"
         
         # Clean up distributed trust bundles after failed build
         cleanup_distributed_bundles
+        
+        # Clean up plugin binaries after failed build
+        cleanup_plugin_binaries
         
         return 1
     fi
