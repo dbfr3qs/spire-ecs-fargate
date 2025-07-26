@@ -1,0 +1,145 @@
+# Envoy Configuration for Web Application (Client-side Proxy)
+# This configuration handles incoming HTTP requests and makes outgoing mTLS connections to API service
+
+node:
+  id: "web-app-envoy"
+  cluster: "fargate-envoy-spire"
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+  # Listener for incoming HTTP traffic (from external users)
+  - name: web_app_http_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8080  # External HTTP port
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: web_app_ingress
+          codec_type: AUTO
+          route_config:
+            name: local_route
+            virtual_hosts:
+            - name: web_app
+              domains: ["*"]
+              routes:
+              # Route to local web application for main content
+              - match:
+                  prefix: "/"
+                  headers:
+                  - name: ":path"
+                    string_match:
+                      exact: "/"
+                route:
+                  cluster: web_app_local
+              - match:
+                  prefix: "/health"
+                route:
+                  cluster: web_app_local
+              - match:
+                  prefix: "/json"
+                route:
+                  cluster: web_app_local
+              # Route API calls to local web app (which will then call API service via mTLS)
+              - match:
+                  prefix: "/api-call"
+                route:
+                  cluster: web_app_local
+                  timeout: 30s
+              # Static assets and other paths go to local app
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: web_app_local
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+  # SPIRE Agent cluster for SDS certificate management
+  - name: spire_agent
+    connect_timeout: 0.25s
+    http2_protocol_options: {}
+    load_assignment:
+      cluster_name: spire_agent
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              pipe:
+                path: /tmp/spire-agent/public/api.sock
+
+  # Local web application (plain HTTP)
+  - name: web_app_local
+    connect_timeout: 0.25s
+    type: STATIC
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: web_app_local
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: 127.0.0.1  # Local web app container
+                port_value: 8081     # Internal plain HTTP port
+
+  # API Service via mTLS
+  - name: api_service_mtls
+    connect_timeout: 0.25s
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: api_service_mtls
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: api-service-with-agent  # Docker service name
+                port_value: 8080                 # API service Envoy mTLS port
+    # mTLS transport socket for outgoing connections
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        common_tls_context:
+          # Use SPIRE-issued certificate for client authentication
+          tls_certificate_sds_secret_configs:
+          - name: "spiffe://example.org/demo-app"
+            sds_config:
+              resource_api_version: V3
+              api_config_source:
+                api_type: GRPC
+                transport_api_version: V3
+                grpc_services:
+                  envoy_grpc:
+                    cluster_name: spire_agent
+          # Validate server certificate using SPIRE trust bundle
+          combined_validation_context:
+            default_validation_context:
+              # Expect API service identity
+              match_typed_subject_alt_names:
+              - san_type: URI
+                matcher:
+                  exact: "spiffe://example.org/api-service"
+            validation_context_sds_secret_config:
+              name: "spiffe://example.org"
+              sds_config:
+                resource_api_version: V3
+                api_config_source:
+                  api_type: GRPC
+                  transport_api_version: V3
+                  grpc_services:
+                    envoy_grpc:
+                      cluster_name: spire_agent

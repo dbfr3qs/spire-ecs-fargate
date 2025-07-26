@@ -1,0 +1,60 @@
+# Base Envoy Configuration Template for SPIRE Integration
+# This template demonstrates the core patterns for SPIRE SDS integration
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  # SPIRE Agent cluster for SDS certificate management
+  clusters:
+  - name: spire_agent
+    connect_timeout: 0.25s
+    http2_protocol_options: {}
+    load_assignment:
+      cluster_name: spire_agent
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              pipe:
+                path: /tmp/spire-agent/public/api.sock
+
+# Key Configuration Patterns for SPIRE-Envoy Integration:
+#
+# 1. Certificate Configuration (for service identity):
+#    tls_certificate_sds_secret_configs:
+#    - name: "spiffe://example.org/your-service-identity"
+#      sds_config:
+#        resource_api_version: V3
+#        api_config_source:
+#          api_type: GRPC
+#          transport_api_version: V3
+#          grpc_services:
+#            envoy_grpc:
+#              cluster_name: spire_agent
+#
+# 2. Trust Bundle Configuration (for peer validation):
+#    validation_context_sds_secret_config:
+#      name: "spiffe://example.org"
+#      sds_config:
+#        resource_api_version: V3
+#        api_config_source:
+#          api_type: GRPC
+#          transport_api_version: V3
+#          grpc_services:
+#            envoy_grpc:
+#              cluster_name: spire_agent
+#
+# 3. Peer Validation (for mTLS):
+#    combined_validation_context:
+#      default_validation_context:
+#        match_typed_subject_alt_names:
+#        - san_type: URI
+#          matcher:
+#            exact: "spiffe://example.org/expected-peer-identity"
+#      validation_context_sds_secret_config:
+#        name: "spiffe://example.org"
+#        sds_config: # ... (same as above)
