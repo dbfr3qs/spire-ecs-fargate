@@ -1,0 +1,28 @@
+{
+  "name": "spire-envoy-react-demo",
+  "version": "1.0.0",
+  "description": "SPIRE Envoy Service Mesh Demo - React Application",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "npm run build:frontend",
+    "build:frontend": "cd frontend && npm run build",
+    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "dev:frontend": "cd frontend && npm start",
+    "dev:backend": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "https": "^1.0.0",
+    "tls": "^0.0.1",
+    "net": "^1.0.2"
+  },
+  "devDependencies": {
+    "concurrently": "^7.6.0",
+    "nodemon": "^2.0.20"
+  },
+  "keywords": ["spire", "envoy", "mtls", "react", "ecs", "fargate"],
+  "author": "SPIRE Envoy Demo",
+  "license": "MIT"
+}

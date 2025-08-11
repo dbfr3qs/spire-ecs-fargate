@@ -62,7 +62,7 @@ static_resources:
             # Validate client certificates using SPIRE trust bundle
             combined_validation_context:
               default_validation_context:
-                # Accept connections from web app and CLI client
+                # Accept connections from web app, React app, and CLI client
                 match_typed_subject_alt_names:
                 - san_type: URI
                   matcher:
@@ -70,6 +70,9 @@ static_resources:
                 - san_type: URI
                   matcher:
                     exact: "spiffe://example.org/cli-client"
+                - san_type: URI
+                  matcher:
+                    exact: "spiffe://example.org/react-demo-app"
               validation_context_sds_secret_config:
                 name: "spiffe://example.org"
                 sds_config:

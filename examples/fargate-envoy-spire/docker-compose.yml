@@ -137,6 +137,38 @@ services:
     stdin_open: true
     tty: true
 
+  # React Application with Envoy Sidecar
+  react-demo-app:
+    build:
+      context: ./react-app-with-envoy
+      args:
+        - BUILD_DATE=${BUILD_DATE:-$(date)}
+    ports:
+      - "3000:8080"  # Envoy proxy port (external access)
+      - "3001:8081"  # Node.js backend port (for debugging)
+      - "9904:9901"  # Envoy admin interface
+    networks:
+      - spire-network
+    volumes:
+      - spire_agent_socket_react:/tmp/spire-agent/public
+    depends_on:
+      spire-server:
+        condition: service_healthy
+      ecs-metadata-mock:
+        condition: service_healthy
+      api-service-with-agent:
+        condition: service_healthy
+    environment:
+      - ECS_CONTAINER_METADATA_URI_V4=http://ecs-metadata-mock/v4
+      - AWS_REGION=us-east-1
+      - NODE_ENV=production
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
 networks:
   spire-network:
     driver: bridge
@@ -150,3 +182,4 @@ volumes:
   spire_agent_socket:
   spire_agent_socket_api:
   spire_agent_socket_cli:
+  spire_agent_socket_react:
